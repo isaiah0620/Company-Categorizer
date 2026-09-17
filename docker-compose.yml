@@ -1,0 +1,42 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: company-categorizer-db
+    environment:
+      POSTGRES_USER: categorizer
+      POSTGRES_PASSWORD: localtestpassword
+      POSTGRES_DB: company_categorizer
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U categorizer -d company_categorizer"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build: .
+    container_name: company-categorizer-app
+    env_file:
+      - .env
+    environment:
+      # Overrides .env's DATABASE_URL so the app talks to the local
+      # Postgres above instead of whatever DATABASE_URL points to.
+      DATABASE_URL: postgresql://categorizer:localtestpassword@postgres:5432/company_categorizer
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Default: one batch, then exit (good for testing, and for the
+    # "OS-scheduler runs this periodically" setup - see README).
+    #
+    # For an always-on container that schedules itself internally via
+    # node-cron (no OS-level scheduler needed), instead use:
+    #   command: ["node", "dist/index.js"]
+    #   restart: unless-stopped
+    command: ["node", "dist/index.js", "--once"]
+
+volumes:
+  pgdata:
