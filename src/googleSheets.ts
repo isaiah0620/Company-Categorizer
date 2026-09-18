@@ -6,8 +6,24 @@ const RANGE = `${config.google.sheetName}`;
 
 let sheetsClient: sheets_v4.Sheets | null = null;
 
+/**
+ * The pipeline reads from Postgres now; this module is only loaded (lazily,
+ * via dynamic import) when SHEET_WRITEBACK_ENABLED=true and you still want
+ * results mirrored into the old spreadsheet.
+ */
+function spreadsheetId(): string {
+  const id = config.google.spreadsheetId;
+  if (!id) throw new Error('GOOGLE_SPREADSHEET_ID is not set but sheet write-back is enabled');
+  return id;
+}
+
 async function getClient(): Promise<sheets_v4.Sheets> {
   if (sheetsClient) return sheetsClient;
+  if (!config.google.clientEmail || !config.google.privateKey) {
+    throw new Error(
+      'Sheet write-back is enabled but GOOGLE_SERVICE_ACCOUNT_EMAIL / GOOGLE_PRIVATE_KEY are not set'
+    );
+  }
   const auth = new google.auth.JWT({
     email: config.google.clientEmail,
     key: config.google.privateKey,
@@ -26,7 +42,7 @@ async function getClient(): Promise<sheets_v4.Sheets> {
 export async function getRows(): Promise<SheetRow[]> {
   const sheets = await getClient();
   const res = await sheets.spreadsheets.values.get({
-    spreadsheetId: config.google.spreadsheetId,
+    spreadsheetId: spreadsheetId(),
     range: RANGE,
   });
 
@@ -55,7 +71,7 @@ export async function updateRowByDomain(
 
   // Re-fetch header + rows to find the matching row and column indices.
   const res = await sheets.spreadsheets.values.get({
-    spreadsheetId: config.google.spreadsheetId,
+    spreadsheetId: spreadsheetId(),
     range: RANGE,
   });
   const [header, ...rows] = res.data.values ?? [];
@@ -89,7 +105,7 @@ export async function updateRowByDomain(
   if (requests.length === 0) return;
 
   await sheets.spreadsheets.values.batchUpdate({
-    spreadsheetId: config.google.spreadsheetId,
+    spreadsheetId: spreadsheetId(),
     requestBody: {
       valueInputOption: 'RAW',
       data: requests,

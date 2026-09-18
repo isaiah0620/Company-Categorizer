@@ -1,7 +1,7 @@
 {
   "name": "company-categorizer-ts",
   "version": "1.0.0",
-  "description": "TypeScript port of the n8n 'Companies - Uncategorized' categorization workflow (Google Sheets + Firecrawl + Claude + Postgres).",
+  "description": "Categorizes companies by polling Postgres (metadata->>'checked' is not true), scraping with Firecrawl or Tavily, and classifying with Claude using prompt caching. Token usage is written back into the row's JSONB.",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {

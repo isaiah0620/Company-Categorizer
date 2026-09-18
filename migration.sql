@@ -1,29 +1,15 @@
--- company_metadata: one row per company, everything in a JSONB blob so new
--- fields can be added without a migration.
-CREATE TABLE IF NOT EXISTS public.company_metadata (
-  id TEXT PRIMARY KEY,
-  metadata JSONB NOT NULL,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
+-- Run this against an EXISTING company_metadata table (the one that already
+-- holds your rows). It is additive and idempotent: no data is rewritten.
 
--- The pipeline polls "everything where metadata->>'checked' is not true".
--- Without an index that is a sequential scan of the whole table on every run.
--- This partial index contains ONLY the unprocessed rows, so it shrinks as the
--- backlog is worked through and the claim query stays fast at any table size.
---
--- The predicate is the crash-proof form of `(metadata->>'checked')::boolean
--- IS NOT TRUE`: a direct ::boolean cast raises on any value that isn't
--- boolean-ish, which would abort a batch because of one bad row.
+-- 1. Index the unprocessed rows so the claim query doesn't scan the table.
 CREATE INDEX IF NOT EXISTS company_metadata_pending_idx
   ON public.company_metadata (created_at)
   WHERE COALESCE(lower(metadata->>'checked') IN ('true','t','yes','1','y'), false) IS NOT TRUE;
 
--- Used when looking a company up by domain rather than by id.
 CREATE INDEX IF NOT EXISTS company_metadata_domain_idx
   ON public.company_metadata ((metadata->>'domain'));
 
--- Handy view for tracking spend without writing the COALESCE dance by hand.
+-- 2. Spend-tracking view.
 CREATE OR REPLACE VIEW public.company_token_usage AS
 SELECT
   id,
@@ -36,3 +22,15 @@ SELECT
   metadata->>'checked_at'                                                   AS checked_at,
   metadata->>'scrape_provider'                                              AS scrape_provider
 FROM public.company_metadata;
+
+-- 3. OPTIONAL: clear stale claim stamps left by a process that was killed
+--    mid-run. The pipeline already reclaims these after STALE_CLAIM_MS, so
+--    this is only for forcing an immediate retry.
+-- UPDATE public.company_metadata
+--    SET metadata = metadata - 'processing_started_at'
+--  WHERE metadata ? 'processing_started_at';
+
+-- 4. OPTIONAL: reset a batch of rows to be reprocessed from scratch.
+-- UPDATE public.company_metadata
+--    SET metadata = metadata || '{"checked": null, "errors": null}'::jsonb
+--  WHERE metadata->>'domain' IN ('example.com');

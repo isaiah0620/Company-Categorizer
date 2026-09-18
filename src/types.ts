@@ -3,25 +3,60 @@
  */
 
 export interface GoogleConfig {
-  clientEmail: string;
-  privateKey: string;
-  spreadsheetId: string;
+  enabled: boolean;
+  clientEmail?: string;
+  privateKey?: string;
+  spreadsheetId?: string;
   sheetName: string;
 }
 
 export interface FirecrawlConfig {
-  apiKey: string;
+  apiKey?: string;
   baseUrl: string;
+  /** Requests per minute we allow ourselves to send. */
+  rpm: number;
+  /** Max simultaneous in-flight requests. */
+  concurrency: number;
+  timeoutMs: number;
+}
+
+export interface TavilyConfig {
+  enabled: boolean;
+  apiKey?: string;
+  baseUrl: string;
+  extractDepth: 'basic' | 'advanced';
+  rpm: number;
+  concurrency: number;
+  timeoutMs: number;
+}
+
+export type ScrapeProvider = 'firecrawl' | 'tavily';
+
+export interface ScraperConfig {
+  /** Which provider to try first. */
+  primary: ScrapeProvider;
+  /** Provider to fall back to when the primary fails, or null to disable. */
+  fallback: ScrapeProvider | null;
 }
 
 export interface AnthropicConfig {
   apiKey: string;
   model: string;
+  maxTokens: number;
+  /** Prompt-cache TTL. '5m' is free to refresh; '1h' costs 2x on writes. */
+  cacheTtl: '5m' | '1h';
+  cacheEnabled: boolean;
+  /** Fire a max_tokens:0 warm-up call before fanning out in parallel. */
+  prewarmCache: boolean;
+  rpm: number;
+  concurrency: number;
 }
 
 export interface DatabaseConfig {
   connectionString: string;
   ssl: boolean;
+  table: string;
+  poolMax: number;
 }
 
 export interface SshConfig {
@@ -32,41 +67,100 @@ export interface SshConfig {
   privateKey?: string;
   passphrase?: string;
   password?: string;
+  readyTimeoutMs: number;
+  /** SHA256 host key fingerprint, required when using password auth (no key pair to protect the tunnel otherwise). */
+  hostFingerprint?: string;
 }
 
 export interface PipelineConfig {
   batchSize: number;
-  scrapeDelayMs: number;
-  betweenCompanyDelayMs: number;
+  /** How many companies are processed at the same time. */
+  concurrency: number;
+  /** Rows claimed but never finished are re-claimable after this long. */
+  staleClaimMs: number;
+  /** Re-attempt rows that already have an `errors` value. */
+  retryErrored: boolean;
+  /** Max retry attempts for a transient (429/5xx/network) failure. */
+  maxRetries: number;
   scheduleCron: string;
   runOnStartup: boolean;
+  /** Also mirror results back into the Google Sheet. Off by default now. */
+  sheetWriteback: boolean;
 }
 
 export interface AppConfig {
   google: GoogleConfig;
   firecrawl: FirecrawlConfig;
+  tavily: TavilyConfig;
+  scraper: ScraperConfig;
   anthropic: AnthropicConfig;
   database: DatabaseConfig;
   ssh: SshConfig;
   pipeline: PipelineConfig;
 }
 
-/** A row read back from the Google Sheet, keyed by header name. */
-export interface SheetRow {
-  __rowNumber: number;
-  Domains?: string;
-  Category?: string;
-  'Sub Category'?: string;
-  Note?: string;
-  Checked?: string;
-  Errors?: string;
-  [column: string]: string | number | undefined;
+/* ------------------------------------------------------------------ */
+/* Database records                                                    */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The JSONB payload stored in company_metadata.metadata. Only the keys the
+ * pipeline reads or writes are typed; everything else the row already
+ * carries (record_id, row_number, last_interaction_*, ...) is preserved
+ * untouched because every write is a JSONB merge, never a replace.
+ */
+export interface CompanyMetadata {
+  name?: string | null;
+  domain?: string | null;
+  note?: string | null;
+  errors?: string | null;
+  checked?: boolean | string | null;
+  category?: string | null;
+  sub_category?: string | null;
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  cache_read_input_tokens?: number | null;
+  cache_creation_input_tokens?: number | null;
+  checked_at?: string | null;
+  processing_started_at?: string | null;
+  last_run_usage?: TokenUsage | null;
+  [key: string]: unknown;
 }
 
-/** Fields that can be written back to a sheet row via updateRowByDomain. */
-export type SheetUpdateFields = Partial<
-  Record<'Category' | 'Sub Category' | 'Note' | 'Checked' | 'Errors', string>
->;
+/** A row claimed from the database for processing. */
+export interface PendingCompany {
+  id: string;
+  domain: string;
+  metadata: CompanyMetadata;
+}
+
+/** Token counters for a single Claude call. */
+export interface TokenUsage {
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_input_tokens: number;
+  cache_creation_input_tokens: number;
+  model?: string;
+  at?: string;
+}
+
+export const EMPTY_USAGE: TokenUsage = {
+  input_tokens: 0,
+  output_tokens: 0,
+  cache_read_input_tokens: 0,
+  cache_creation_input_tokens: 0,
+};
+
+/* ------------------------------------------------------------------ */
+/* Scraping                                                            */
+/* ------------------------------------------------------------------ */
+
+export interface ScrapeResult {
+  markdown: string;
+  statusCode?: number;
+  sourceUrl?: string;
+  provider: ScrapeProvider;
+}
 
 export interface FirecrawlScrapeMetadata {
   statusCode?: number;
@@ -89,6 +183,27 @@ export interface FirecrawlMapResponse {
   [key: string]: unknown;
 }
 
+export interface TavilyExtractResult {
+  url?: string;
+  raw_content?: string;
+  [key: string]: unknown;
+}
+
+export interface TavilyFailedResult {
+  url?: string;
+  error?: string;
+}
+
+export interface TavilyExtractResponse {
+  results?: TavilyExtractResult[];
+  failed_results?: TavilyFailedResult[];
+  response_time?: number;
+}
+
+/* ------------------------------------------------------------------ */
+/* Categorization                                                      */
+/* ------------------------------------------------------------------ */
+
 /** One category assignment returned by Claude for a company. */
 export interface CategoryAssignment {
   category: string;
@@ -102,7 +217,13 @@ export interface CategorizationResult {
   categories: CategoryAssignment[];
 }
 
-/** Flattened Category / Sub Category / Note columns the sheet expects. */
+/** Categorization plus the token counters the call consumed. */
+export interface CategorizationOutcome {
+  result: CategorizationResult;
+  usage: TokenUsage;
+}
+
+/** Flattened Category / Sub Category / Note values. */
 export interface CombinedCategorization {
   companyName: string;
   combinedCategory: string;
@@ -110,11 +231,19 @@ export interface CombinedCategorization {
   combinedNote: string;
 }
 
-export interface CompanyMetadataRecord {
-  Domains: string;
-  companyName: string;
-  Category: string;
-  'Sub Category': string;
-  Note: string;
-  Checked: string;
+/** Fields that can be written back to a sheet row via updateRowByDomain. */
+export type SheetUpdateFields = Partial<
+  Record<'Category' | 'Sub Category' | 'Note' | 'Checked' | 'Errors', string>
+>;
+
+/** A row read back from the Google Sheet, keyed by header name. */
+export interface SheetRow {
+  __rowNumber: number;
+  Domains?: string;
+  Category?: string;
+  'Sub Category'?: string;
+  Note?: string;
+  Checked?: string;
+  Errors?: string;
+  [column: string]: string | number | undefined;
 }

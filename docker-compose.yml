@@ -23,17 +23,39 @@ services:
     env_file:
       - .env
     environment:
-      # Overrides .env's DATABASE_URL so the app talks to the local
-      # Postgres above instead of whatever DATABASE_URL points to.
+      # ---- Local Postgres (overrides whatever .env's DATABASE_URL says) ----
+      # Comment this line out to run against your REAL database instead.
       DATABASE_URL: postgresql://categorizer:localtestpassword@postgres:5432/company_categorizer
+
+      # ---- Scraper selection ------------------------------------------------
+      # Flip Tavily on/off right here without touching .env or the code.
+      #
+      #   TAVILY_ENABLED=false                -> Firecrawl only (default)
+      #   TAVILY_ENABLED=true  + SCRAPE_PROVIDER=firecrawl
+      #                                       -> Firecrawl first, Tavily rescues
+      #                                          the domains Firecrawl fails on
+      #   TAVILY_ENABLED=true  + SCRAPE_PROVIDER=tavily
+      #                                       -> Tavily first, Firecrawl as backup
+      #
+      # ${VAR:-default} reads from your shell, so you can also do:
+      #   TAVILY_ENABLED=true SCRAPE_PROVIDER=tavily docker compose up
+      TAVILY_ENABLED: "${TAVILY_ENABLED:-false}"
+      SCRAPE_PROVIDER: "${SCRAPE_PROVIDER:-firecrawl}"
+      SCRAPE_FALLBACK_PROVIDER: "${SCRAPE_FALLBACK_PROVIDER:-tavily}"
+      TAVILY_API_KEY: "${TAVILY_API_KEY:-}"
+      TAVILY_EXTRACT_DEPTH: "${TAVILY_EXTRACT_DEPTH:-basic}"
+
+      # ---- Throughput -------------------------------------------------------
+      # Keep these low while testing so you don't burn credits.
+      BATCH_SIZE: "${BATCH_SIZE:-5}"
+      PIPELINE_CONCURRENCY: "${PIPELINE_CONCURRENCY:-2}"
     depends_on:
       postgres:
         condition: service_healthy
-    # Default: one batch, then exit (good for testing, and for the
-    # "OS-scheduler runs this periodically" setup - see README).
+    # Default: one batch, then exit - good for testing and for letting an
+    # OS-level scheduler decide the cadence.
     #
-    # For an always-on container that schedules itself internally via
-    # node-cron (no OS-level scheduler needed), instead use:
+    # For an always-on container that schedules itself with node-cron, use:
     #   command: ["node", "dist/index.js"]
     #   restart: unless-stopped
     command: ["node", "dist/index.js", "--once"]

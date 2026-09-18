@@ -1,59 +1,190 @@
 import 'dotenv/config';
-import type { AppConfig } from './types.js';
+import type { AppConfig, ScrapeProvider } from './types.js';
 
-function required(name: string, fallback?: string): string {
-  const value = process.env[name] ?? fallback;
+function str(name: string, fallback: string): string {
+  const value = process.env[name];
+  return value === undefined || value === '' ? fallback : value;
+}
+
+function opt(name: string): string | undefined {
+  const value = process.env[name];
+  return value === undefined || value === '' ? undefined : value;
+}
+
+function required(name: string): string {
+  const value = opt(name);
   if (value === undefined) {
     throw new Error(`Missing required environment variable: ${name}`);
   }
   return value;
 }
 
+function bool(name: string, fallback: boolean): boolean {
+  const value = opt(name);
+  if (value === undefined) return fallback;
+  return ['true', '1', 'yes', 'on'].includes(value.toLowerCase());
+}
+
+function num(name: string, fallback: number): number {
+  const value = opt(name);
+  if (value === undefined) return fallback;
+  const parsed = Number(value);
+  if (Number.isNaN(parsed)) {
+    throw new Error(`Environment variable ${name} must be a number, got "${value}"`);
+  }
+  return parsed;
+}
+
+function pem(name: string): string | undefined {
+  const value = opt(name);
+  return value ? value.replace(/\\n/g, '\n') : undefined;
+}
+
+function provider(name: string, fallback: ScrapeProvider): ScrapeProvider {
+  const value = str(name, fallback).toLowerCase();
+  if (value !== 'firecrawl' && value !== 'tavily') {
+    throw new Error(`${name} must be "firecrawl" or "tavily", got "${value}"`);
+  }
+  return value;
+}
+
+const tavilyEnabled = bool('TAVILY_ENABLED', false);
+const primaryProvider = provider('SCRAPE_PROVIDER', 'firecrawl');
+
+// "none" disables the fallback. Default: once Tavily is switched on, whichever
+// provider isn't primary rescues the domains the primary fails on.
+const defaultFallback = tavilyEnabled
+  ? primaryProvider === 'tavily'
+    ? 'firecrawl'
+    : 'tavily'
+  : 'none';
+const fallbackRaw = str('SCRAPE_FALLBACK_PROVIDER', defaultFallback).toLowerCase();
+const fallbackProvider: ScrapeProvider | null =
+  fallbackRaw === 'none' || fallbackRaw === ''
+    ? null
+    : provider('SCRAPE_FALLBACK_PROVIDER', defaultFallback === 'none' ? 'tavily' : defaultFallback);
+
+const cacheTtlRaw = str('ANTHROPIC_CACHE_TTL', '5m').toLowerCase();
+if (cacheTtlRaw !== '5m' && cacheTtlRaw !== '1h') {
+  throw new Error(`ANTHROPIC_CACHE_TTL must be "5m" or "1h", got "${cacheTtlRaw}"`);
+}
+
 export const config: AppConfig = {
   google: {
-    clientEmail: required('GOOGLE_SERVICE_ACCOUNT_EMAIL'),
-    privateKey: required('GOOGLE_PRIVATE_KEY').replace(/\\n/g, '\n'),
-    spreadsheetId: required('GOOGLE_SPREADSHEET_ID'),
-    sheetName: required('GOOGLE_SHEET_NAME', 'Companies - Uncategorized'),
+    // Sheets is now optional: the pipeline reads from Postgres. Turn this on
+    // only if you still want results mirrored into the old spreadsheet.
+    enabled: bool('SHEET_WRITEBACK_ENABLED', false),
+    clientEmail: opt('GOOGLE_SERVICE_ACCOUNT_EMAIL'),
+    privateKey: pem('GOOGLE_PRIVATE_KEY'),
+    spreadsheetId: opt('GOOGLE_SPREADSHEET_ID'),
+    sheetName: str('GOOGLE_SHEET_NAME', 'Companies - Uncategorized'),
   },
   firecrawl: {
-    apiKey: required('FIRECRAWL_API_KEY'),
-    baseUrl: required('FIRECRAWL_BASE_URL', 'https://api.firecrawl.dev/v1'),
+    apiKey: opt('FIRECRAWL_API_KEY'),
+    baseUrl: str('FIRECRAWL_BASE_URL', 'https://api.firecrawl.dev/v1'),
+    rpm: num('FIRECRAWL_RPM', 20),
+    concurrency: num('FIRECRAWL_CONCURRENCY', 4),
+    timeoutMs: num('FIRECRAWL_TIMEOUT_MS', 120000),
+  },
+  tavily: {
+    enabled: tavilyEnabled,
+    apiKey: opt('TAVILY_API_KEY'),
+    baseUrl: str('TAVILY_BASE_URL', 'https://api.tavily.com'),
+    extractDepth: str('TAVILY_EXTRACT_DEPTH', 'basic') === 'advanced' ? 'advanced' : 'basic',
+    rpm: num('TAVILY_RPM', 60),
+    concurrency: num('TAVILY_CONCURRENCY', 4),
+    timeoutMs: num('TAVILY_TIMEOUT_MS', 60000),
+  },
+  scraper: {
+    primary: primaryProvider,
+    fallback: fallbackProvider === primaryProvider ? null : fallbackProvider,
   },
   anthropic: {
     apiKey: required('ANTHROPIC_API_KEY'),
-    model: required('ANTHROPIC_MODEL', 'claude-sonnet-4-6'),
+    model: str('ANTHROPIC_MODEL', 'claude-sonnet-4-6'),
+    maxTokens: num('ANTHROPIC_MAX_TOKENS', 1500),
+    cacheTtl: cacheTtlRaw,
+    cacheEnabled: bool('ANTHROPIC_PROMPT_CACHE', true),
+    prewarmCache: bool('ANTHROPIC_PREWARM_CACHE', true),
+    rpm: num('ANTHROPIC_RPM', 40),
+    concurrency: num('ANTHROPIC_CONCURRENCY', 4),
   },
   database: {
     connectionString: required('DATABASE_URL'),
     // Set DATABASE_SSL=true for hosted Postgres (Neon, Supabase, etc.).
     // Leave unset for local Postgres, Cloud SQL via the Cloud Run socket
     // connector, or when SSH_TUNNEL_ENABLED handles the transport instead.
-    ssl: (process.env.DATABASE_SSL ?? 'false') === 'true',
+    ssl: bool('DATABASE_SSL', false),
+    table: str('DATABASE_TABLE', 'public.company_metadata'),
+    // One connection per worker plus a spare for the claim query. Through an
+    // SSH tunnel every connection is a separate forwarded channel, so this is
+    // the knob to turn down if the bastion limits them.
+    poolMax: num('DATABASE_POOL_MAX', Math.max(2, num('PIPELINE_CONCURRENCY', 4) + 1)),
   },
   ssh: {
-    // Set true when Postgres is only reachable by SSHing into its VPS
-    // first (i.e. the same thing the n8n Postgres node's "SSH Tunnel"
-    // option does). DATABASE_URL should then use the host/port Postgres
-    // listens on FROM THE VPS'S OWN PERSPECTIVE (usually 127.0.0.1:5432) -
-    // the tunnel rewrites that to a local forwarded port at connection
-    // time; the SSH host itself is configured separately below.
-    enabled: (process.env.SSH_TUNNEL_ENABLED ?? 'false') === 'true',
-    host: process.env.SSH_HOST,
-    port: Number(process.env.SSH_PORT ?? 22),
-    username: process.env.SSH_USERNAME,
-    // Provide EITHER a private key (recommended) OR a password.
-    privateKey: process.env.SSH_PRIVATE_KEY
-      ? process.env.SSH_PRIVATE_KEY.replace(/\\n/g, '\n')
-      : undefined,
-    passphrase: process.env.SSH_PRIVATE_KEY_PASSPHRASE || undefined,
-    password: process.env.SSH_PASSWORD || undefined,
+    // Set true when Postgres is only reachable by SSHing into its VPS first.
+    enabled: bool('SSH_TUNNEL_ENABLED', false),
+    host: opt('SSH_HOST'),
+    port: num('SSH_PORT', 22),
+    username: opt('SSH_USERNAME'),
+    privateKey: pem('SSH_PRIVATE_KEY'),
+    passphrase: opt('SSH_PRIVATE_KEY_PASSPHRASE'),
+    password: opt('SSH_PASSWORD'),
+    readyTimeoutMs: num('SSH_READY_TIMEOUT_MS', 20000),
+    hostFingerprint: opt('SSH_HOST_FINGERPRINT'),
   },
   pipeline: {
-    batchSize: Number(process.env.BATCH_SIZE ?? 10),
-    scrapeDelayMs: Number(process.env.SCRAPE_DELAY_MS ?? 20000),
-    betweenCompanyDelayMs: Number(process.env.BETWEEN_COMPANY_DELAY_MS ?? 3000),
-    scheduleCron: process.env.SCHEDULE_CRON ?? '*/15 * * * *',
-    runOnStartup: (process.env.RUN_ON_STARTUP ?? 'true') === 'true',
+    batchSize: num('BATCH_SIZE', 25),
+    concurrency: num('PIPELINE_CONCURRENCY', 4),
+    staleClaimMs: num('STALE_CLAIM_MS', 15 * 60 * 1000),
+    retryErrored: bool('RETRY_ERRORED', false),
+    maxRetries: num('MAX_RETRIES', 5),
+    scheduleCron: str('SCHEDULE_CRON', '*/15 * * * *'),
+    runOnStartup: bool('RUN_ON_STARTUP', true),
+    sheetWriteback: bool('SHEET_WRITEBACK_ENABLED', false),
   },
 };
+
+/**
+ * Fails fast at startup with a readable message instead of blowing up
+ * halfway through a batch because a provider was switched on without
+ * its API key.
+ */
+export function validateConfig(): void {
+  const problems: string[] = [];
+  const usesFirecrawl =
+    config.scraper.primary === 'firecrawl' || config.scraper.fallback === 'firecrawl';
+  const usesTavily = config.scraper.primary === 'tavily' || config.scraper.fallback === 'tavily';
+
+  if (usesFirecrawl && !config.firecrawl.apiKey) {
+    problems.push('FIRECRAWL_API_KEY is required when Firecrawl is the primary or fallback scraper');
+  }
+  if (usesTavily) {
+    if (!config.tavily.enabled) {
+      problems.push(
+        'Tavily is selected as a scraper but TAVILY_ENABLED is not true - set TAVILY_ENABLED=true'
+      );
+    }
+    if (!config.tavily.apiKey) {
+      problems.push('TAVILY_API_KEY is required when Tavily is the primary or fallback scraper');
+    }
+  }
+  if (config.pipeline.sheetWriteback) {
+    if (!config.google.clientEmail || !config.google.privateKey || !config.google.spreadsheetId) {
+      problems.push(
+        'SHEET_WRITEBACK_ENABLED=true requires GOOGLE_SERVICE_ACCOUNT_EMAIL, GOOGLE_PRIVATE_KEY and GOOGLE_SPREADSHEET_ID'
+      );
+    }
+  }
+  if (config.ssh.enabled && !config.ssh.privateKey && !config.ssh.password) {
+    problems.push('SSH_TUNNEL_ENABLED=true requires either SSH_PRIVATE_KEY or SSH_PASSWORD');
+  }
+
+  if (config.pipeline.concurrency < 1) {
+    problems.push('PIPELINE_CONCURRENCY must be at least 1');
+  }
+
+  if (problems.length > 0) {
+    throw new Error(`Invalid configuration:\n  - ${problems.join('\n  - ')}`);
+  }
+}
