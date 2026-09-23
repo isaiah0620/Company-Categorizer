@@ -1,7 +1,7 @@
 {
   "name": "company-categorizer-ts",
   "version": "1.0.0",
-  "description": "Categorizes companies by polling Postgres (metadata->>'checked' is not true), scraping with Firecrawl or Tavily, and classifying with Claude using prompt caching. Token usage is written back into the row's JSONB.",
+  "description": "Categorizes companies by polling Postgres (metadata->>'checked' is not true), scraping with Firecrawl or Tavily, and classifying with either Claude or OpenAI (LLM_PROVIDER) using prompt caching. Token usage is written back into the row's JSONB.",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
@@ -18,6 +18,7 @@
     "dotenv": "^16.4.5",
     "googleapis": "^144.0.0",
     "node-cron": "^3.0.3",
+    "openai": "^7.22.0",
     "pg": "^8.13.0",
     "tunnel-ssh": "^5.2.0"
   },

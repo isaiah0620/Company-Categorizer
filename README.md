@@ -1,11 +1,46 @@
 # company-categorizer-ts
 
-Polls Postgres for companies that haven't been categorized yet, scrapes each
-one (Firecrawl, or Tavily), classifies it with Claude, and writes the result
-plus the exact token cost back into the row's JSONB `metadata`.
+Polls Postgres for companies that haven't been categorized yet, first checks
+each one's name and domain with an LLM (a clear operating business is stored
+as a Target immediately), otherwise scrapes it (Firecrawl, or Tavily),
+classifies it with an LLM, and writes the result plus the exact token cost
+back into the row's JSONB `metadata`.
 
 **Setup instructions live in [SETUP.md](./SETUP.md)** — local first, then
 Cloud Run.
+
+## Choosing a provider: Anthropic or OpenAI
+
+Set `LLM_PROVIDER=anthropic` (the default) or `LLM_PROVIDER=openai` in your
+`.env`. Only the selected provider's API key is required at startup —
+`validateConfig()` fails fast with a clear message if it's missing, and
+doesn't require the other provider's key at all.
+
+```bash
+# Anthropic (default)
+LLM_PROVIDER=anthropic
+ANTHROPIC_API_KEY=sk-ant-...
+ANTHROPIC_MODEL=claude-sonnet-4-6
+
+# OpenAI
+LLM_PROVIDER=openai
+OPENAI_API_KEY=sk-...
+OPENAI_MODEL=gpt-4o-mini
+```
+
+Everything provider-agnostic — the name screen's threshold, retry counts,
+pipeline concurrency, the categorizer's rules — stays exactly the same either
+way; only which API actually gets called changes. `src/llm.ts` is the single
+switch point: `pipeline.ts` and `index.ts` call `categorizeCompany()`,
+`screenCompanyName()`, `prewarmCaches()` and `closeLlm()` from there without
+knowing which provider is behind them.
+
+Both providers cache the (identical) system prompts in `src/prompts.ts`
+automatically once a run's prefix clears their minimum cacheable length —
+1,024–4,096 tokens depending on the specific Anthropic model, a flat 1,024
+tokens on OpenAI. See the "Prompt caching" section below for the Anthropic
+specifics; on OpenAI there's no TTL or cache_control to configure, it just
+works once the threshold is cleared.
 
 ## What changed in this version
 
@@ -119,14 +154,57 @@ TAVILY_ENABLED=true TAVILY_API_KEY=tvly-... docker compose up --build  # + Tavil
 TAVILY_ENABLED=true SCRAPE_PROVIDER=tavily TAVILY_API_KEY=tvly-... docker compose up --build  # Tavily first
 ```
 
+### 7. Name + domain pre-screen
+
+Before any scraping, `src/nameScreen.ts` asks Claude one narrow question using
+only the company's **name and domain**: is this clearly an operating business
+(a Target)?
+
+| Screen says | What happens |
+|---|---|
+| `target`, confidence ≥ `NAME_SCREEN_MIN_CONFIDENCE` (0.9) | Stored as `category = "Target"` straight away. **No Firecrawl/Tavily call, no categorization call.** |
+| `target` below the threshold, `not_target`, or `unsure` | Continues down the original scrape → categorize path, untouched. |
+| Screen call fails, returns bad JSON, or the row has no `name` | Same as above - it fails *open*, so a broken screen can never wrongly settle or fail a company. |
+
+The prompt is deliberately conservative because the two errors are not
+symmetric: a wrong `target` is recorded without anyone opening the website,
+while `unsure` only costs the scrape you'd have done anyway. Generic words
+(Group, Holdings, Partners, Solutions), bare surnames/brand names, and anything
+containing finance/advisory/recruiting/legal words never qualify on their own.
+
+What lands in the row's `metadata`, in both outcomes:
+
+- `classification_source` - `name_screen` or `scrape`.
+- `name_screen` - `{ verdict, confidence, reason, skipped_scrape, at }`, kept even
+  when the screen fell through, so you can audit its calls.
+- Screen tokens are added to the same cumulative `input_tokens` / `output_tokens`
+  counters as everything else. For name-screened rows `scrape_provider` is `null`.
+
+Trade-offs to know about:
+
+- Every company that is *not* settled by name now costs one extra small model
+  call (~300 input tokens; the prompt is under the 1,024-token caching minimum,
+  so it isn't cached). It shares `ANTHROPIC_RPM` with the categorizer.
+- A name-screened Target is only ever `Target`. The full path can assign a
+  second category when the site shows a separate business line; the screen
+  can't. Audit with `WHERE metadata->>'classification_source' = 'name_screen'`.
+- Turn it off with `NAME_SCREEN_ENABLED=false` and behaviour is identical to
+  before.
+
 ## Layout
 
 | File | Role |
 |---|---|
 | `src/index.ts` | entrypoint, cron, graceful shutdown |
-| `src/pipeline.ts` | claim → scrape → classify → write back, worker pool |
+| `src/pipeline.ts` | claim → name screen → scrape → classify → write back, worker pool |
+| `src/llm.ts` | provider switch (`LLM_PROVIDER`) — the only file pipeline.ts/index.ts import from for LLM calls |
+| `src/claudeAgent.ts` | Anthropic backend: client, prompt caching, cache pre-warm, usage extraction |
+| `src/openaiAgent.ts` | OpenAI backend: client, automatic caching usage extraction, warm-up |
+| `src/prompts.ts` | the two system prompts, shared verbatim by both backends |
+| `src/categorization.ts` | categorizer JSON parsing/validation + category flattening, shared by both backends |
+| `src/nameScreen.ts` | Anthropic-backed name + domain pre-screen call |
+| `src/nameScreenParsing.ts` | name-screen input cleaning + output parsing, shared by both backends |
 | `src/db.ts` | claim query, JSONB merge writes, token accumulation |
-| `src/claudeAgent.ts` | prompt, prompt caching, cache pre-warm, usage extraction |
 | `src/scraper.ts` | provider selection and fallback |
 | `src/firecrawl.ts`, `src/tavily.ts` | the two scrapers |
 | `src/rateLimit.ts` | token bucket + concurrency + AIMD backoff |

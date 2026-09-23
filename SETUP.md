@@ -121,7 +121,9 @@ Every processed row now carries, inside `metadata`:
 | `input_tokens`, `output_tokens` | **cumulative** across attempts |
 | `cache_read_input_tokens`, `cache_creation_input_tokens` | cache hits / writes |
 | `last_run_usage` | the most recent call's breakdown, with model and timestamp |
-| `scrape_provider` | `firecrawl` or `tavily` |
+| `scrape_provider` | `firecrawl` or `tavily`; `null` when the name screen settled it |
+| `classification_source` | `name_screen` (decided from name + domain, never scraped) or `scrape` |
+| `name_screen` | the pre-screen's `verdict`, `confidence`, `reason`, and whether it skipped the scrape |
 
 Everything else in the row — `record_id`, `row_number`, `created_by`,
 `last_interaction_with`, `industry_thesis` — is untouched. Every write is a
@@ -534,6 +536,33 @@ If you see `[ratelimit:...] 429 received`, the limiter has already halved its
 own rate and will walk it back up. Occasional 429s are fine and self-correct.
 Constant ones mean your configured RPM is above your real limit — lower it.
 
+## Name screen
+
+Every company first gets a cheap name + domain check (`NAME_SCREEN_*` in
+`.env`). A confident Target is stored immediately and never scraped; anything
+else continues as before. See the README (section 7) for the rules.
+
+See how much it is saving, and audit what it decided:
+
+```sql
+SELECT metadata->>'classification_source' AS source, count(*)
+  FROM public.company_metadata
+ WHERE metadata->>'checked' = 'true'
+ GROUP BY 1;
+
+SELECT metadata->>'domain' AS domain,
+       metadata->'name_screen'->>'confidence' AS confidence,
+       metadata->'name_screen'->>'reason'     AS reason
+  FROM public.company_metadata
+ WHERE metadata->>'classification_source' = 'name_screen'
+ ORDER BY (metadata->'name_screen'->>'confidence')::numeric ASC
+ LIMIT 50;   -- least-confident skips first: read these to judge the threshold
+```
+
+If you find bad skips, raise `NAME_SCREEN_MIN_CONFIDENCE` (e.g. `0.95`). Note
+that each extra un-skipped company costs one more small Anthropic request, so
+if you sit near your `ANTHROPIC_RPM` limit, leave a little headroom.
+
 ## Prompt caching
 
 `5m` vs `1h` comes down to your cron interval:
@@ -573,6 +602,12 @@ UPDATE public.company_metadata
 ## Reprocessing
 
 ```sql
+-- send name-screened Targets back through the full scrape + categorize path
+-- (run with NAME_SCREEN_ENABLED=false, or they will just be screened again)
+UPDATE public.company_metadata
+   SET metadata = (metadata - 'name_screen') || '{"checked": null}'::jsonb
+ WHERE metadata->>'classification_source' = 'name_screen';
+
 -- retry everything that errored
 UPDATE public.company_metadata
    SET metadata = metadata || '{"errors": null}'::jsonb

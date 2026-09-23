@@ -210,6 +210,7 @@ export async function claimPendingCompanies(limit: number): Promise<PendingCompa
     staleSeconds,
   ]);
 
+  
   return rows.map((row) => ({
     id: row.id,
     domain: String(row.metadata?.domain ?? row.id).trim(),

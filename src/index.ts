@@ -3,7 +3,7 @@ import { config, validateConfig } from './config.js';
 import { runPipeline } from './pipeline.js';
 import { assertConnection, closePool } from './db.js';
 import { closeScrapers } from './scraper.js';
-import { closeAnthropic } from './claudeAgent.js';
+import { closeLlm } from './llm.js';
 
 const runOnce = process.argv.includes('--once');
 
@@ -29,7 +29,7 @@ async function shutdown(code = 0): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
   closeScrapers();
-  closeAnthropic();
+  closeLlm();
   await closePool().catch(() => undefined);
   process.exit(code);
 }
@@ -38,11 +38,24 @@ async function main(): Promise<void> {
   validateConfig();
   await assertConnection();
 
+  const model = config.llm.provider === 'openai' ? config.openai.model : config.anthropic.model;
+  // Cache TTL is meaningful for Anthropic only; OpenAI's caching is automatic
+  // with no TTL knob, so it's just reported as "on" when that provider is active.
+  const cacheStatus =
+    config.llm.provider === 'openai'
+      ? 'on(automatic)'
+      : config.anthropic.cacheEnabled
+        ? config.anthropic.cacheTtl
+        : 'off';
+
   console.log(
-    `[index] scraper=${config.scraper.primary}` +
+    `[index] provider=${config.llm.provider} model=${model}` +
+      ` scraper=${config.scraper.primary}` +
       `${config.scraper.fallback ? ` (fallback: ${config.scraper.fallback})` : ''}` +
-      ` model=${config.anthropic.model}` +
-      ` cache=${config.anthropic.cacheEnabled ? config.anthropic.cacheTtl : 'off'}` +
+      ` name-screen=${
+        config.nameScreen.enabled ? `on(min ${config.nameScreen.minConfidence})` : 'off'
+      }` +
+      ` cache=${cacheStatus}` +
       ` batch=${config.pipeline.batchSize} concurrency=${config.pipeline.concurrency}`
   );
 

@@ -40,7 +40,8 @@ export interface ScraperConfig {
 }
 
 export interface AnthropicConfig {
-  apiKey: string;
+  /** Optional at the type level because it's only required when LLM_PROVIDER=anthropic; see validateConfig(). */
+  apiKey?: string;
   model: string;
   maxTokens: number;
   /** Prompt-cache TTL. '5m' is free to refresh; '1h' costs 2x on writes. */
@@ -48,6 +49,22 @@ export interface AnthropicConfig {
   cacheEnabled: boolean;
   /** Fire a max_tokens:0 warm-up call before fanning out in parallel. */
   prewarmCache: boolean;
+  rpm: number;
+  concurrency: number;
+}
+
+/** Which LLM backend the pipeline calls for name-screening and categorization. */
+export type LlmProvider = 'anthropic' | 'openai';
+
+export interface LlmConfig {
+  provider: LlmProvider;
+}
+
+export interface OpenAiConfig {
+  /** Optional at the type level because it's only required when LLM_PROVIDER=openai; see validateConfig(). */
+  apiKey?: string;
+  model: string;
+  maxTokens: number;
   rpm: number;
   concurrency: number;
 }
@@ -72,6 +89,17 @@ export interface SshConfig {
   hostFingerprint?: string;
 }
 
+export interface NameScreenConfig {
+  /** Run the name/domain pre-screen before any scrape or categorization. */
+  enabled: boolean;
+  /**
+   * Minimum self-reported confidence (0-1) for a "target" verdict to skip the
+   * scrape + categorization. Anything below this continues down the full path.
+   */
+  minConfidence: number;
+  maxTokens: number;
+}
+
 export interface PipelineConfig {
   batchSize: number;
   /** How many companies are processed at the same time. */
@@ -93,7 +121,10 @@ export interface AppConfig {
   firecrawl: FirecrawlConfig;
   tavily: TavilyConfig;
   scraper: ScraperConfig;
+  llm: LlmConfig;
   anthropic: AnthropicConfig;
+  openai: OpenAiConfig;
+  nameScreen: NameScreenConfig;
   database: DatabaseConfig;
   ssh: SshConfig;
   pipeline: PipelineConfig;
@@ -124,6 +155,10 @@ export interface CompanyMetadata {
   checked_at?: string | null;
   processing_started_at?: string | null;
   last_run_usage?: TokenUsage | null;
+  /** How the category was decided: from the name alone, or from scraped content. */
+  classification_source?: 'name_screen' | 'scrape' | null;
+  /** Audit trail of the name/domain pre-screen, kept even when it fell through. */
+  name_screen?: NameScreenRecord | null;
   [key: string]: unknown;
 }
 
@@ -150,6 +185,41 @@ export const EMPTY_USAGE: TokenUsage = {
   cache_read_input_tokens: 0,
   cache_creation_input_tokens: 0,
 };
+
+/* ------------------------------------------------------------------ */
+/* Name screening                                                      */
+/* ------------------------------------------------------------------ */
+
+/**
+ * "target"     - name/domain make it clear this is an operating business.
+ * "not_target" - name/domain point at a financial / advisory / deal-community firm.
+ * "unsure"     - the name alone can't settle it.
+ *
+ * Only a confident "target" short-circuits the pipeline; the other two both
+ * continue on to scrape + categorize.
+ */
+export type NameScreenVerdict = 'target' | 'not_target' | 'unsure';
+
+export interface NameScreenResult {
+  verdict: NameScreenVerdict;
+  /** 0-1, as reported by the model. */
+  confidence: number;
+  reason: string;
+}
+
+export interface NameScreenOutcome {
+  result: NameScreenResult;
+  usage: TokenUsage;
+  /** True when the verdict is "target" and confidence clears the threshold. */
+  isConfidentTarget: boolean;
+}
+
+/** What gets persisted under metadata.name_screen. */
+export interface NameScreenRecord extends NameScreenResult {
+  /** True when this verdict is why the scrape + categorization never ran. */
+  skipped_scrape: boolean;
+  at: string;
+}
 
 /* ------------------------------------------------------------------ */
 /* Scraping                                                            */

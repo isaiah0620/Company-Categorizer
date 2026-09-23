@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import type { AppConfig, ScrapeProvider } from './types.js';
+import type { AppConfig, LlmProvider, ScrapeProvider } from './types.js';
 
 function str(name: string, fallback: string): string {
   const value = process.env[name];
@@ -44,6 +44,14 @@ function provider(name: string, fallback: ScrapeProvider): ScrapeProvider {
   const value = str(name, fallback).toLowerCase();
   if (value !== 'firecrawl' && value !== 'tavily') {
     throw new Error(`${name} must be "firecrawl" or "tavily", got "${value}"`);
+  }
+  return value;
+}
+
+function llmProvider(name: string, fallback: LlmProvider): LlmProvider {
+  const value = str(name, fallback).toLowerCase();
+  if (value !== 'anthropic' && value !== 'openai') {
+    throw new Error(`${name} must be "anthropic" or "openai", got "${value}"`);
   }
   return value;
 }
@@ -99,8 +107,17 @@ export const config: AppConfig = {
     primary: primaryProvider,
     fallback: fallbackProvider === primaryProvider ? null : fallbackProvider,
   },
+  llm: {
+    // Which backend name-screening and categorization calls go through.
+    // Everything else in this file (name screen thresholds, retries,
+    // pipeline concurrency) is provider-agnostic and applies either way.
+    provider: llmProvider('LLM_PROVIDER', 'anthropic'),
+  },
   anthropic: {
-    apiKey: required('ANTHROPIC_API_KEY'),
+    // Not `required()` here: only enforced when LLM_PROVIDER=anthropic (the
+    // default), so an OpenAI-only setup doesn't need this key at all. See
+    // validateConfig() below for the actual enforcement.
+    apiKey: opt('ANTHROPIC_API_KEY'),
     model: str('ANTHROPIC_MODEL', 'claude-sonnet-4-6'),
     maxTokens: num('ANTHROPIC_MAX_TOKENS', 1500),
     cacheTtl: cacheTtlRaw,
@@ -109,13 +126,30 @@ export const config: AppConfig = {
     rpm: num('ANTHROPIC_RPM', 40),
     concurrency: num('ANTHROPIC_CONCURRENCY', 4),
   },
+  openai: {
+    // Same deal as anthropic.apiKey above, but for LLM_PROVIDER=openai.
+    apiKey: opt('OPENAI_API_KEY'),
+    model: str('OPENAI_MODEL', 'gpt-4o-mini'),
+    maxTokens: num('OPENAI_MAX_TOKENS', 1500),
+    // OpenAI's own rate limits are typically much higher than Anthropic's
+    // default tiers; adjust to your account's actual limits.
+    rpm: num('OPENAI_RPM', 500),
+    concurrency: num('OPENAI_CONCURRENCY', 8),
+  },
+  nameScreen: {
+    // Cheap first pass on name + domain. A confident "target" is stored as-is
+    // and never reaches Firecrawl/Tavily or the categorizer.
+    enabled: bool('NAME_SCREEN_ENABLED', true),
+    minConfidence: num('NAME_SCREEN_MIN_CONFIDENCE', 0.9),
+    maxTokens: num('NAME_SCREEN_MAX_TOKENS', 250),
+  },
   database: {
     connectionString: required('DATABASE_URL'),
     // Set DATABASE_SSL=true for hosted Postgres (Neon, Supabase, etc.).
     // Leave unset for local Postgres, Cloud SQL via the Cloud Run socket
     // connector, or when SSH_TUNNEL_ENABLED handles the transport instead.
     ssl: bool('DATABASE_SSL', false),
-    table: str('DATABASE_TABLE', 'public.company_metadata'),
+    table: str('DATABASE_TABLE', 'public.gpt4_company_metadata'),
     // One connection per worker plus a spare for the claim query. Through an
     // SSH tunnel every connection is a separate forwarded channel, so this is
     // the knob to turn down if the bastion limits them.
@@ -169,6 +203,15 @@ export function validateConfig(): void {
       problems.push('TAVILY_API_KEY is required when Tavily is the primary or fallback scraper');
     }
   }
+  if (config.llm.provider === 'anthropic' && !config.anthropic.apiKey) {
+    problems.push(
+      'ANTHROPIC_API_KEY is required when LLM_PROVIDER=anthropic (the default) - set it, or set LLM_PROVIDER=openai instead'
+    );
+  }
+  if (config.llm.provider === 'openai' && !config.openai.apiKey) {
+    problems.push('OPENAI_API_KEY is required when LLM_PROVIDER=openai');
+  }
+
   if (config.pipeline.sheetWriteback) {
     if (!config.google.clientEmail || !config.google.privateKey || !config.google.spreadsheetId) {
       problems.push(
@@ -178,6 +221,10 @@ export function validateConfig(): void {
   }
   if (config.ssh.enabled && !config.ssh.privateKey && !config.ssh.password) {
     problems.push('SSH_TUNNEL_ENABLED=true requires either SSH_PRIVATE_KEY or SSH_PASSWORD');
+  }
+
+  if (config.nameScreen.minConfidence < 0 || config.nameScreen.minConfidence > 1) {
+    problems.push('NAME_SCREEN_MIN_CONFIDENCE must be between 0 and 1');
   }
 
   if (config.pipeline.concurrency < 1) {

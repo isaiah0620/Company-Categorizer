@@ -45,6 +45,12 @@ services:
       TAVILY_API_KEY: "${TAVILY_API_KEY:-}"
       TAVILY_EXTRACT_DEPTH: "${TAVILY_EXTRACT_DEPTH:-basic}"
 
+      # ---- Name + domain pre-screen ------------------------------------------
+      # NAME_SCREEN_ENABLED=false skips the pre-screen and sends every company
+      # straight to scrape + categorize, exactly as before.
+      NAME_SCREEN_ENABLED: "${NAME_SCREEN_ENABLED:-true}"
+      NAME_SCREEN_MIN_CONFIDENCE: "${NAME_SCREEN_MIN_CONFIDENCE:-0.9}"
+
       # ---- Throughput -------------------------------------------------------
       # Keep these low while testing so you don't burn credits.
       BATCH_SIZE: "${BATCH_SIZE:-5}"

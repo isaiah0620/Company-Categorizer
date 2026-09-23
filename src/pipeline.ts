@@ -8,14 +8,28 @@ import {
 } from './db.js';
 import { scrapeCompany, scraperStats } from './scraper.js';
 import { stripImages } from './cleanMarkdown.js';
-import { categorizeCompany, combineCategories, prewarmPromptCache } from './claudeAgent.js';
+import { categorizeCompany, combineCategories, screenCompanyName, prewarmCaches } from './llm.js';
 import { EMPTY_USAGE } from './types.js';
-import type { CompanyMetadata, PendingCompany, TokenUsage } from './types.js';
+import type {
+  CompanyMetadata,
+  NameScreenOutcome,
+  NameScreenRecord,
+  PendingCompany,
+  TokenUsage,
+} from './types.js';
 
 interface RunTotals {
   processed: number;
   failed: number;
+  /** Of `processed`, how many were settled from the name alone (no scrape, no categorizer). */
+  nameScreened: number;
   usage: TokenUsage;
+}
+
+/** How a company was ultimately classified, plus everything the call cost. */
+interface ProcessResult {
+  usage: TokenUsage;
+  via: 'name_screen' | 'scrape';
 }
 
 function addUsage(a: TokenUsage, b: TokenUsage): TokenUsage {
@@ -24,7 +38,17 @@ function addUsage(a: TokenUsage, b: TokenUsage): TokenUsage {
     output_tokens: a.output_tokens + b.output_tokens,
     cache_read_input_tokens: a.cache_read_input_tokens + b.cache_read_input_tokens,
     cache_creation_input_tokens: a.cache_creation_input_tokens + b.cache_creation_input_tokens,
+    // Keep the model/timestamp of the most recent call so last_run_usage stays attributable.
+    model: b.model ?? a.model,
+    at: b.at ?? a.at,
   };
+}
+
+/** Sums two optional usages; undefined means "nothing spent yet". */
+function sumUsage(a: TokenUsage | undefined, b: TokenUsage | undefined): TokenUsage | undefined {
+  if (!a) return b;
+  if (!b) return a;
+  return addUsage(a, b);
 }
 
 /** Pulls the usage counters off an error thrown after a billable API call. */
@@ -42,9 +66,124 @@ async function recordFailure(company: PendingCompany, message: string, usage?: T
   await finishCompany(company.id, patch, usage);
 }
 
-async function processCompany(company: PendingCompany): Promise<TokenUsage> {
+/** Sheet mirroring is best-effort: the database is the source of truth. */
+async function mirrorToSheet(
+  domain: string,
+  category: string,
+  subCategory: string,
+  note: string
+): Promise<void> {
+  if (!config.pipeline.sheetWriteback) return;
+  try {
+    const { updateRowByDomain } = await import('./googleSheets.js');
+    await updateRowByDomain(domain, {
+      Category: category,
+      'Sub Category': subCategory,
+      Note: note,
+      Checked: 'True',
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.warn(`[pipeline] Sheet write-back failed for ${domain}: ${message}`);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Layer 1: name + domain screen                                       */
+/* ------------------------------------------------------------------ */
+
+interface ScreenStep {
+  /** Null when the screen was skipped or failed - either way, carry on. */
+  outcome: NameScreenOutcome | null;
+  /** Tokens spent by the screen, including on a failed/unparseable reply. */
+  usage?: TokenUsage;
+}
+
+/**
+ * Never throws. Any problem with the screen (no name to look at, API error,
+ * malformed JSON) means "we couldn't tell", which is exactly the case that
+ * must fall through to the full scrape-and-categorize path - so a broken
+ * screen can slow a company down but can never wrongly settle or fail it.
+ */
+async function runNameScreen(company: PendingCompany): Promise<ScreenStep> {
+  if (!config.nameScreen.enabled) return { outcome: null };
+
+  const name = typeof company.metadata.name === 'string' ? company.metadata.name.trim() : '';
+  if (!name) {
+    // A domain alone is too thin a basis for skipping verification.
+    console.log(`[name-screen] ${company.domain}: no name on the row - continuing to scrape.`);
+    return { outcome: null };
+  }
+
+  try {
+    const outcome = await screenCompanyName(name, company.domain);
+    const { verdict, confidence, reason } = outcome.result;
+    console.log(
+      `[name-screen] ${company.domain}: ${verdict} (${confidence.toFixed(2)})` +
+        `${outcome.isConfidentTarget ? ' -> skipping scrape' : ' -> continuing'} - ${reason}`
+    );
+    return { outcome, usage: outcome.usage };
+  } catch (err) {
+    const message = err instanceof Error ? err.message.split('\n')[0] : String(err);
+    console.warn(`[name-screen] ${company.domain}: screen failed (${message}) - continuing to scrape.`);
+    return { outcome: null, usage: usageFromError(err) };
+  }
+}
+
+function toRecord(outcome: NameScreenOutcome, skippedScrape: boolean): NameScreenRecord {
+  return { ...outcome.result, skipped_scrape: skippedScrape, at: new Date().toISOString() };
+}
+
+/** Writes a confident name-screen Target straight to the row. No scrape, no categorizer. */
+async function storeNameScreenTarget(
+  company: PendingCompany,
+  name: string,
+  outcome: NameScreenOutcome
+): Promise<ProcessResult> {
+  const { domain } = company;
+  const note =
+    `Target (no subcategory): Classified from company name and domain only; ` +
+    `website was not scraped. ${outcome.result.reason}`.trim();
+
+  const patch: Partial<CompanyMetadata> = {
+    name,
+    domain: company.metadata.domain ?? domain,
+    category: 'Target',
+    sub_category: null,
+    note,
+    errors: null,
+    checked: true,
+    checked_at: new Date().toISOString(),
+    scrape_provider: null,
+    classification_source: 'name_screen',
+    name_screen: toRecord(outcome, true),
+  };
+
+  await finishCompany(company.id, patch, outcome.usage);
+  await mirrorToSheet(domain, 'Target', '', note);
+
+  console.log(`[pipeline] Done: ${domain} -> Target [name screen, scrape skipped]`);
+  return { usage: outcome.usage, via: 'name_screen' };
+}
+
+/* ------------------------------------------------------------------ */
+/* Per-company flow                                                    */
+/* ------------------------------------------------------------------ */
+
+async function processCompany(company: PendingCompany): Promise<ProcessResult> {
   const { domain } = company;
   console.log(`[pipeline] Processing ${domain}`);
+
+  // --- layer 1: name + domain screen (cheap; may settle the company outright) ---
+  const screen = await runNameScreen(company);
+  if (screen.outcome?.isConfidentTarget) {
+    const name = String(company.metadata.name).trim();
+    return storeNameScreenTarget(company, name, screen.outcome);
+  }
+
+  // Everything below is the original flow. Whatever the screen spent is carried
+  // along so it lands in the row's token counters alongside the categorizer's.
+  const screenUsage = screen.usage;
 
   // --- scrape ---
   let scraped;
@@ -53,14 +192,14 @@ async function processCompany(company: PendingCompany): Promise<TokenUsage> {
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error(`[pipeline] Scrape failed for ${domain}: ${message}`);
-    await recordFailure(company, message);
+    await recordFailure(company, message, screenUsage);
     throw new Error(message);
   }
 
   const cleanedMarkdown = stripImages(scraped.markdown);
   if (!cleanedMarkdown) {
     const message = 'No scrapable content returned';
-    await recordFailure(company, message);
+    await recordFailure(company, message, screenUsage);
     throw new Error(message);
   }
 
@@ -72,11 +211,12 @@ async function processCompany(company: PendingCompany): Promise<TokenUsage> {
     const message = err instanceof Error ? err.message : String(err);
     console.error(`[pipeline] Categorization failed for ${domain}: ${message}`);
     // Even a failed parse burned tokens - still bill them to the row.
-    await recordFailure(company, message, usageFromError(err));
+    await recordFailure(company, message, sumUsage(screenUsage, usageFromError(err)));
     throw new Error(message);
   }
 
   const combined = combineCategories(outcome.result);
+  const totalUsage = sumUsage(screenUsage, outcome.usage) ?? outcome.usage;
 
   // --- write result + token usage back into the JSONB ---
   const patch: Partial<CompanyMetadata> = {
@@ -89,31 +229,23 @@ async function processCompany(company: PendingCompany): Promise<TokenUsage> {
     checked: true,
     checked_at: new Date().toISOString(),
     scrape_provider: scraped.provider,
+    classification_source: 'scrape',
+    ...(screen.outcome ? { name_screen: toRecord(screen.outcome, false) } : {}),
   };
 
-  await finishCompany(company.id, patch, outcome.usage);
-
-  if (config.pipeline.sheetWriteback) {
-    try {
-      const { updateRowByDomain } = await import('./googleSheets.js');
-      await updateRowByDomain(domain, {
-        Category: combined.combinedCategory,
-        'Sub Category': combined.combinedSubcategory,
-        Note: combined.combinedNote,
-        Checked: 'True',
-      });
-    } catch (err) {
-      // Sheet mirroring is best-effort: the database is the source of truth.
-      const message = err instanceof Error ? err.message : String(err);
-      console.warn(`[pipeline] Sheet write-back failed for ${domain}: ${message}`);
-    }
-  }
+  await finishCompany(company.id, patch, totalUsage);
+  await mirrorToSheet(
+    domain,
+    combined.combinedCategory,
+    combined.combinedSubcategory,
+    combined.combinedNote
+  );
 
   console.log(
     `[pipeline] Done: ${domain} -> ${combined.combinedCategory || '(no category)'} ` +
       `[${scraped.provider}]`
   );
-  return outcome.usage;
+  return { usage: totalUsage, via: 'scrape' };
 }
 
 /**
@@ -143,9 +275,10 @@ async function runWorkers(companies: PendingCompany[], totals: RunTotals): Promi
       if (!company) return;
 
       try {
-        const usage = await processCompany(company);
+        const result = await processCompany(company);
         totals.processed += 1;
-        totals.usage = addUsage(totals.usage, usage);
+        if (result.via === 'name_screen') totals.nameScreened += 1;
+        totals.usage = addUsage(totals.usage, result.usage);
       } catch {
         // Already logged and already written to the row's `errors` field.
         totals.failed += 1;
@@ -174,11 +307,19 @@ export async function runPipeline(): Promise<void> {
     return;
   }
 
-  // Write the system prompt into the cache once before workers fan out, so
-  // the parallel calls read it instead of each paying for a cache write.
-  await prewarmPromptCache();
+  // Write the active provider's cacheable prompt(s) into its cache once
+  // before workers fan out, so the parallel calls read them instead of each
+  // paying for a cache write. The name screen runs on every claimed company
+  // (before the scrape), so it needs the same treatment as the categorizer
+  // prompt.
+  await prewarmCaches();
 
-  const totals: RunTotals = { processed: 0, failed: 0, usage: { ...EMPTY_USAGE } };
+  const totals: RunTotals = {
+    processed: 0,
+    failed: 0,
+    nameScreened: 0,
+    usage: { ...EMPTY_USAGE },
+  };
   await runWorkers(batch, totals);
 
   const seconds = ((Date.now() - startedAt) / 1000).toFixed(1);
@@ -193,7 +334,9 @@ export async function runPipeline(): Promise<void> {
       : '0.0';
 
   console.log(
-    `[pipeline] Run complete in ${seconds}s: ${totals.processed} ok, ${totals.failed} failed. ` +
+    `[pipeline] Run complete in ${seconds}s: ${totals.processed} ok ` +
+      `(${totals.nameScreened} settled by name screen, ${totals.processed - totals.nameScreened} scraped), ` +
+      `${totals.failed} failed. ` +
       `Tokens this run: in=${usage.input_tokens} out=${usage.output_tokens} ` +
       `cache_read=${usage.cache_read_input_tokens} cache_write=${usage.cache_creation_input_tokens} ` +
       `(${cacheRatio}% of input served from cache). Limiters: ${scraperStats()}.`
