@@ -149,7 +149,7 @@ export const config: AppConfig = {
     // Leave unset for local Postgres, Cloud SQL via the Cloud Run socket
     // connector, or when SSH_TUNNEL_ENABLED handles the transport instead.
     ssl: bool('DATABASE_SSL', false),
-    table: str('DATABASE_TABLE', 'public.gpt4_company_metadata'),
+    table: str('DATABASE_TABLE', 'public.gpt_luna_company_metadata'),
     // One connection per worker plus a spare for the claim query. Through an
     // SSH tunnel every connection is a separate forwarded channel, so this is
     // the knob to turn down if the bastion limits them.
