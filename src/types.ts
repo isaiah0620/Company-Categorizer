@@ -32,6 +32,28 @@ export interface TavilyConfig {
 
 export type ScrapeProvider = 'firecrawl' | 'tavily';
 
+/**
+ * Multi-page mode for the Tavily scraper: map the site (-> `sitemap` column),
+ * pick the pages that describe the business, extract them all, and hand the
+ * combined markdown (-> `scraped_text` column) to the model.
+ */
+export interface SiteCrawlConfig {
+  enabled: boolean;
+  /** How many link levels Tavily Map follows from the homepage (1-5). */
+  mapDepth: number;
+  /** Max links followed per page (1-500). */
+  mapBreadth: number;
+  /** Total URLs Tavily Map will process before stopping. */
+  mapLimit: number;
+  /** Seconds Tavily Map may run before giving up (10-150). */
+  mapTimeoutSec: number;
+  /** Pages extracted per company, homepage included (1-20; Extract's per-call cap). */
+  maxPages: number;
+  maxCharsPerPage: number;
+  /** Hard cap on the text sent to the model, and stored in scraped_text. */
+  maxTotalChars: number;
+}
+
 export interface ScraperConfig {
   /** Which provider to try first. */
   primary: ScrapeProvider;
@@ -116,10 +138,26 @@ export interface PipelineConfig {
   sheetWriteback: boolean;
 }
 
+export interface ApiConfig {
+  port: number;
+  /** Accepted API keys. More than one lets you rotate a key without downtime. */
+  apiKeys: string[];
+  /** Max companies in a single request. */
+  maxBatch: number;
+  /** Companies researched at the same time within one request. */
+  concurrency: number;
+  /** A stored result younger than this many calendar months is served as-is. */
+  resultMaxAgeMonths: number;
+  /** How long a request waits for someone else's in-progress run of the same domain. */
+  waitForInflightMs: number;
+  maxBodyBytes: number;
+}
+
 export interface AppConfig {
   google: GoogleConfig;
   firecrawl: FirecrawlConfig;
   tavily: TavilyConfig;
+  siteCrawl: SiteCrawlConfig;
   scraper: ScraperConfig;
   llm: LlmConfig;
   anthropic: AnthropicConfig;
@@ -128,6 +166,7 @@ export interface AppConfig {
   database: DatabaseConfig;
   ssh: SshConfig;
   pipeline: PipelineConfig;
+  api: ApiConfig;
 }
 
 /* ------------------------------------------------------------------ */
@@ -226,10 +265,15 @@ export interface NameScreenRecord extends NameScreenResult {
 /* ------------------------------------------------------------------ */
 
 export interface ScrapeResult {
+  /** Text handed to the model. In site-crawl mode this is every page, labelled by URL. */
   markdown: string;
   statusCode?: number;
   sourceUrl?: string;
   provider: ScrapeProvider;
+  /** URLs discovered on the site (site-crawl mode only). Stored in the `sitemap` column. */
+  sitemap?: string[];
+  /** URLs whose content made it into `markdown`. */
+  pagesIncluded?: string[];
 }
 
 export interface FirecrawlScrapeMetadata {
@@ -262,6 +306,12 @@ export interface TavilyExtractResult {
 export interface TavilyFailedResult {
   url?: string;
   error?: string;
+}
+
+export interface TavilyMapResponse {
+  base_url?: string;
+  results?: string[];
+  response_time?: number;
 }
 
 export interface TavilyExtractResponse {

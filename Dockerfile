@@ -23,7 +23,10 @@ RUN useradd --create-home --shell /bin/bash appuser \
     && chown -R appuser:appuser /app
 USER appuser
 
-# This image is meant to be run as a Cloud Run JOB, not a Service:
-# each execution processes one batch and exits (see src/index.ts --once).
-# Cloud Scheduler is what decides how often that happens (see deploy/).
-CMD ["node", "dist/index.js", "--once"]
+# Default: run as a Cloud Run JOB - each execution processes one batch and
+# exits (see src/index.ts --once). Cloud Scheduler decides how often (deploy/).
+#
+# The same image also serves the HTTP API; override the command:
+#   node dist/server.js        (listens on $PORT, default 8080; needs API_KEY)
+EXPOSE 8080
+CMD ["node", "dist/server.js"]

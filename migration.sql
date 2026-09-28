@@ -1,6 +1,25 @@
 -- Run this against an EXISTING company_metadata table (the one that already
 -- holds your rows). It is additive and idempotent: no data is rewritten.
 
+-- 0. Crawl output columns. REQUIRED: the app refuses to start without them.
+--    sitemap      - URLs Tavily Map discovered on the site, one per line
+--    scraped_text - the exact markdown text that was sent to the model
+ALTER TABLE public.company_metadata
+  ADD COLUMN IF NOT EXISTS sitemap TEXT,
+  ADD COLUMN IF NOT EXISTS scraped_text TEXT;
+
+-- 0b. ONLY if you already ran an earlier version of this migration that created
+--     `sitemap` as JSONB: convert it to TEXT, keeping existing data (one URL per
+--     line). Uncomment and run all four statements together.
+-- BEGIN;
+-- ALTER TABLE public.company_metadata ADD COLUMN sitemap_text TEXT;
+-- UPDATE public.company_metadata
+--    SET sitemap_text = (SELECT string_agg(u, E'\n') FROM jsonb_array_elements_text(sitemap) AS u)
+--  WHERE jsonb_typeof(sitemap) = 'array';
+-- ALTER TABLE public.company_metadata DROP COLUMN sitemap;
+-- ALTER TABLE public.company_metadata RENAME COLUMN sitemap_text TO sitemap;
+-- COMMIT;
+
 -- 1. Index the unprocessed rows so the claim query doesn't scan the table.
 CREATE INDEX IF NOT EXISTS company_metadata_pending_idx
   ON public.company_metadata (created_at)
@@ -8,6 +27,12 @@ CREATE INDEX IF NOT EXISTS company_metadata_pending_idx
 
 CREATE INDEX IF NOT EXISTS company_metadata_domain_idx
   ON public.company_metadata ((metadata->>'domain'));
+
+-- Used by the HTTP API's "have we already researched this domain?" lookup,
+-- which compares lower(metadata->>'domain'). The index above is on the
+-- un-lowered value, so Postgres cannot use it for that comparison.
+CREATE INDEX IF NOT EXISTS company_metadata_domain_lower_idx
+  ON public.company_metadata ((lower(metadata->>'domain')));
 
 -- 2. Spend-tracking view.
 CREATE OR REPLACE VIEW public.company_token_usage AS

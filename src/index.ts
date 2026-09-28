@@ -1,7 +1,7 @@
 import cron from 'node-cron';
 import { config, validateConfig } from './config.js';
 import { runPipeline } from './pipeline.js';
-import { assertConnection, closePool } from './db.js';
+import { assertConnection, assertScrapeColumns, closePool } from './db.js';
 import { closeScrapers } from './scraper.js';
 import { closeLlm } from './llm.js';
 
@@ -37,6 +37,7 @@ async function shutdown(code = 0): Promise<void> {
 async function main(): Promise<void> {
   validateConfig();
   await assertConnection();
+  await assertScrapeColumns();
 
   const model = config.llm.provider === 'openai' ? config.openai.model : config.anthropic.model;
   // Cache TTL is meaningful for Anthropic only; OpenAI's caching is automatic
@@ -51,6 +52,7 @@ async function main(): Promise<void> {
   console.log(
     `[index] provider=${config.llm.provider} model=${model}` +
       ` scraper=${config.scraper.primary}` +
+      `${config.scraper.primary === 'tavily' || config.scraper.fallback === 'tavily' ? (config.siteCrawl.enabled ? `[site-crawl: ${config.siteCrawl.maxPages} pages]` : '[single-page]') : ''}` +
       `${config.scraper.fallback ? ` (fallback: ${config.scraper.fallback})` : ''}` +
       ` name-screen=${
         config.nameScreen.enabled ? `on(min ${config.nameScreen.minConfidence})` : 'off'

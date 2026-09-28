@@ -103,6 +103,17 @@ export const config: AppConfig = {
     concurrency: num('TAVILY_CONCURRENCY', 4),
     timeoutMs: num('TAVILY_TIMEOUT_MS', 60000),
   },
+  siteCrawl: {
+    // Only affects the Tavily scraper. Off = the original one-page extract.
+    enabled: bool('SITE_CRAWL_ENABLED', true),
+    mapDepth: Math.min(5, Math.max(1, num('SITE_MAP_DEPTH', 2))),
+    mapBreadth: Math.min(500, Math.max(1, num('SITE_MAP_BREADTH', 20))),
+    mapLimit: Math.max(1, num('SITE_MAP_LIMIT', 50)),
+    mapTimeoutSec: Math.min(150, Math.max(10, num('SITE_MAP_TIMEOUT_SEC', 60))),
+    maxPages: Math.min(20, Math.max(1, num('SITE_MAX_PAGES', 6))),
+    maxCharsPerPage: Math.max(500, num('SITE_MAX_CHARS_PER_PAGE', 8000)),
+    maxTotalChars: Math.max(1000, num('SITE_MAX_TOTAL_CHARS', 30000)),
+  },
   scraper: {
     primary: primaryProvider,
     fallback: fallbackProvider === primaryProvider ? null : fallbackProvider,
@@ -149,7 +160,7 @@ export const config: AppConfig = {
     // Leave unset for local Postgres, Cloud SQL via the Cloud Run socket
     // connector, or when SSH_TUNNEL_ENABLED handles the transport instead.
     ssl: bool('DATABASE_SSL', false),
-    table: str('DATABASE_TABLE', 'public.gpt_luna_company_metadata'),
+    table: str('DATABASE_TABLE', 'public.company_metadata'),
     // One connection per worker plus a spare for the claim query. Through an
     // SSH tunnel every connection is a separate forwarded channel, so this is
     // the knob to turn down if the bastion limits them.
@@ -176,6 +187,20 @@ export const config: AppConfig = {
     scheduleCron: str('SCHEDULE_CRON', '*/15 * * * *'),
     runOnStartup: bool('RUN_ON_STARTUP', true),
     sheetWriteback: bool('SHEET_WRITEBACK_ENABLED', false),
+  },
+  api: {
+    // Cloud Run injects PORT; API_PORT is for everywhere else.
+    port: num('PORT', num('API_PORT', 8080)),
+    // Comma-separated so a new key can be added before the old one is removed.
+    apiKeys: (opt('API_KEY') ?? '')
+      .split(',')
+      .map((k) => k.trim())
+      .filter(Boolean),
+    maxBatch: Math.max(1, Math.floor(num('API_MAX_BATCH', 25))),
+    concurrency: Math.max(1, Math.floor(num('API_CONCURRENCY', num('PIPELINE_CONCURRENCY', 4)))),
+    resultMaxAgeMonths: Math.max(1, Math.floor(num('RESULT_MAX_AGE_MONTHS', 6))),
+    waitForInflightMs: Math.max(0, num('API_WAIT_FOR_INFLIGHT_MS', 120_000)),
+    maxBodyBytes: 1_048_576,
   },
 };
 
@@ -233,5 +258,31 @@ export function validateConfig(): void {
 
   if (problems.length > 0) {
     throw new Error(`Invalid configuration:\n  - ${problems.join('\n  - ')}`);
+  }
+}
+
+/**
+ * Extra checks for the HTTP server only. Kept separate from validateConfig()
+ * so the batch job doesn't start demanding an API key it never uses.
+ *
+ * Every request the API accepts can spend scrape and model credits, so running
+ * it without authentication is refused outright rather than warned about.
+ */
+export function validateApiConfig(): void {
+  const problems: string[] = [];
+  if (config.api.apiKeys.length === 0) {
+    problems.push(
+      'API_KEY is required to run the HTTP API (any request can spend scrape + model credits). ' +
+        'Generate one with: openssl rand -hex 32'
+    );
+  }
+  if (config.api.apiKeys.some((k) => k.length < 16)) {
+    problems.push('Every API_KEY must be at least 16 characters');
+  }
+  if (!Number.isInteger(config.api.port) || config.api.port < 1 || config.api.port > 65535) {
+    problems.push('PORT / API_PORT must be an integer between 1 and 65535');
+  }
+  if (problems.length > 0) {
+    throw new Error(`Invalid API configuration:\n  - ${problems.join('\n  - ')}`);
   }
 }

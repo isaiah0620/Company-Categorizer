@@ -45,6 +45,13 @@ services:
       TAVILY_API_KEY: "${TAVILY_API_KEY:-}"
       TAVILY_EXTRACT_DEPTH: "${TAVILY_EXTRACT_DEPTH:-basic}"
 
+      # ---- Multi-page crawl (Tavily only) -----------------------------------
+      # Tavily map -> `sitemap` column; extracted pages -> `scraped_text` column
+      # and the model's input. SITE_CRAWL_ENABLED=false = homepage only.
+      SITE_CRAWL_ENABLED: "${SITE_CRAWL_ENABLED:-true}"
+      SITE_MAX_PAGES: "${SITE_MAX_PAGES:-4}"
+      SITE_MAP_LIMIT: "${SITE_MAP_LIMIT:-30}"
+
       # ---- Name + domain pre-screen ------------------------------------------
       # NAME_SCREEN_ENABLED=false skips the pre-screen and sends every company
       # straight to scrape + categorize, exactly as before.
@@ -65,6 +72,31 @@ services:
     #   command: ["node", "dist/index.js"]
     #   restart: unless-stopped
     command: ["node", "dist/index.js", "--once"]
+
+  # The HTTP API: same image, different command. Needs API_KEY in .env.
+  #   docker compose up --build api
+  #   curl -X POST localhost:8080/v1/companies/categorize \
+  #     -H "Authorization: Bearer $API_KEY" -H "Content-Type: application/json" \
+  #     -d '{"domain":"stripe.com","name":"Stripe"}'
+  api:
+    build: .
+    container_name: company-categorizer-api
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://categorizer:localtestpassword@postgres:5432/company_categorizer
+      TAVILY_ENABLED: "${TAVILY_ENABLED:-false}"
+      SCRAPE_PROVIDER: "${SCRAPE_PROVIDER:-firecrawl}"
+      SCRAPE_FALLBACK_PROVIDER: "${SCRAPE_FALLBACK_PROVIDER:-tavily}"
+      TAVILY_API_KEY: "${TAVILY_API_KEY:-}"
+      API_PORT: "8080"
+    ports:
+      - "9090:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["node", "dist/server.js"]
+    restart: unless-stopped
 
 volumes:
   pgdata:

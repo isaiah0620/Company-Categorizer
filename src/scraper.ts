@@ -1,6 +1,7 @@
 import { config } from './config.js';
 import { scrapeWithFirecrawl, firecrawlLimiter } from './firecrawl.js';
 import { scrapeWithTavily, tavilyLimiter } from './tavily.js';
+import { crawlSiteWithTavily } from './siteCrawl.js';
 import type { ScrapeProvider, ScrapeResult } from './types.js';
 
 /** Bare domains in the database ("example.com") need a scheme. */
@@ -11,7 +12,9 @@ export function toUrl(domain: string): string {
 }
 
 function runProvider(provider: ScrapeProvider, url: string): Promise<ScrapeResult> {
-  return provider === 'tavily' ? scrapeWithTavily(url) : scrapeWithFirecrawl(url);
+  if (provider === 'firecrawl') return scrapeWithFirecrawl(url);
+  // Tavily: map the site + extract the key pages, unless multi-page mode is off.
+  return config.siteCrawl.enabled ? crawlSiteWithTavily(url) : scrapeWithTavily(url);
 }
 
 /**

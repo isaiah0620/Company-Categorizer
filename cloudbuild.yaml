@@ -1,0 +1,59 @@
+# Run by a Cloud Build trigger on every push to main (see README / walkthrough).
+#
+# Builds ONE image and rolls it out to both the API (Cloud Run service) and the
+# batch job (Cloud Run job). Only the image is changed: env vars, secrets,
+# scaling and the scheduler are configured once and left alone here, so a push
+# to GitHub can never accidentally change a secret or a setting.
+#
+# Both the service and the job must already exist (created once by hand - see
+# deploy/gcp-setup.sh) or the deploy steps below will fail.
+
+substitutions:
+  _REGION: us-central1
+  _AR_REPO: company-categorizer-ts
+  _SERVICE: company-categorizer-api
+  _JOB: company-categorizer-ts
+
+steps:
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/app:$BUILD_ID
+      - .
+
+  - id: push
+    name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/app:$BUILD_ID
+
+  # Updating only --image keeps the service's existing env vars, secrets and settings.
+  - id: deploy-service
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - ${_SERVICE}
+      - --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/app:$BUILD_ID
+      - --region=${_REGION}
+
+  - id: deploy-job
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run
+      - jobs
+      - update
+      - ${_JOB}
+      - --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/app:$BUILD_ID
+      - --region=${_REGION}
+
+images:
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/app:$BUILD_ID
+
+options:
+  # Required when the trigger runs as your own service account.
+  logging: CLOUD_LOGGING_ONLY

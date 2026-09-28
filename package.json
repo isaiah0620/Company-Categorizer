@@ -10,7 +10,9 @@
     "run-once": "node dist/index.js --once",
     "dev": "tsx src/index.ts",
     "dev:once": "tsx src/index.ts --once",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "serve": "node dist/server.js",
+    "dev:server": "tsx src/server.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.32.0",

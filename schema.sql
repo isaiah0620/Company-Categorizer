@@ -3,6 +3,10 @@
 CREATE TABLE IF NOT EXISTS public.company_metadata (
   id TEXT PRIMARY KEY,
   metadata JSONB NOT NULL,
+  -- Filled by the crawler: URLs Tavily Map found on the site (one per line), and the exact
+  -- markdown text that was sent to the model.
+  sitemap TEXT,
+  scraped_text TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -22,6 +26,12 @@ CREATE INDEX IF NOT EXISTS company_metadata_pending_idx
 -- Used when looking a company up by domain rather than by id.
 CREATE INDEX IF NOT EXISTS company_metadata_domain_idx
   ON public.company_metadata ((metadata->>'domain'));
+
+-- Used by the HTTP API's "have we already researched this domain?" lookup,
+-- which compares lower(metadata->>'domain'). The index above is on the
+-- un-lowered value, so Postgres cannot use it for that comparison.
+CREATE INDEX IF NOT EXISTS company_metadata_domain_lower_idx
+  ON public.company_metadata ((lower(metadata->>'domain')));
 
 -- Handy view for tracking spend without writing the COALESCE dance by hand.
 CREATE OR REPLACE VIEW public.company_token_usage AS

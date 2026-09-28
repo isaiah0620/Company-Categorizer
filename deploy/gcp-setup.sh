@@ -143,3 +143,23 @@ gcloud scheduler jobs create http "$SCHEDULER_JOB" \
 #   gcloud run jobs update "$JOB_NAME" --region="$REGION" \
 #     --update-env-vars="TAVILY_ENABLED=true,SCRAPE_FALLBACK_PROVIDER=tavily" \
 #     --update-secrets="TAVILY_API_KEY=TAVILY_API_KEY:latest"
+
+# ---- 9. OPTIONAL: the HTTP API as a Cloud Run SERVICE ----
+# Same image as the Job; only the command differs. The Job keeps running the
+# batch on its schedule - the two coexist safely (see README "HTTP API").
+#
+#   printf '%s' "$(openssl rand -hex 32)" | gcloud secrets create API_KEY --data-file=-
+#
+#   gcloud run deploy company-categorizer-api \
+#     --image="$IMAGE" --region="$REGION" \
+#     --command=node --args=dist/server.js \
+#     --cpu=1 --memory=512Mi \
+#     --timeout=900 \           # a request waits for the scrape + model calls
+#     --concurrency=20 --max-instances=3 \
+#     --no-cpu-throttling \      # keeps CPU on between requests; needed if you use the SSH tunnel
+#     --allow-unauthenticated \  # callers still need the API key; drop this to use IAM instead
+#     --set-env-vars="<same tuning + provider vars as the Job>" \
+#     --set-secrets="API_KEY=API_KEY:latest,<same secrets as the Job>"
+#
+# Cloud Run sends SIGTERM and allows ~10s before killing the instance; the
+# server uses that window to let in-flight research reach the database.

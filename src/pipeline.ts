@@ -4,6 +4,7 @@ import {
   countPending,
   finishCompany,
   isTransportHealthy,
+  saveScrapeData,
   tokenTotals,
 } from './db.js';
 import { scrapeCompany, scraperStats } from './scraper.js';
@@ -170,7 +171,7 @@ async function storeNameScreenTarget(
 /* Per-company flow                                                    */
 /* ------------------------------------------------------------------ */
 
-async function processCompany(company: PendingCompany): Promise<ProcessResult> {
+export async function processCompany(company: PendingCompany): Promise<ProcessResult> {
   const { domain } = company;
   console.log(`[pipeline] Processing ${domain}`);
 
@@ -201,6 +202,19 @@ async function processCompany(company: PendingCompany): Promise<ProcessResult> {
     const message = 'No scrapable content returned';
     await recordFailure(company, message, screenUsage);
     throw new Error(message);
+  }
+
+  // --- persist the crawl (sitemap + scraped_text columns) ---
+  // Done before the model call so a failed categorization never costs us the
+  // crawl we already paid for.
+  try {
+    await saveScrapeData(company.id, {
+      sitemap: scraped.sitemap ?? null,
+      scrapedText: cleanedMarkdown,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[pipeline] Could not save sitemap/scraped_text for ${domain}: ${message}`);
   }
 
   // --- categorize ---

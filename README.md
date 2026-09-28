@@ -42,6 +42,121 @@ tokens on OpenAI. See the "Prompt caching" section below for the Anthropic
 specifics; on OpenAI there's no TTL or cache_control to configure, it just
 works once the threshold is cleared.
 
+## HTTP API
+
+Besides the scheduled batch job, the same pipeline is available on demand over
+HTTP. Send one company or a list; for each domain the API either returns what
+is already stored or researches it, stores the result, and returns that.
+
+```bash
+npm run dev:server           # from source
+npm run build && npm run serve
+```
+
+Needs `API_KEY` (the server refuses to start without one - every request can
+spend scrape and model credits) plus the same database / provider settings as
+the batch job. Run `migration.sql` once: it adds an index the lookup uses.
+
+### `POST /v1/companies/categorize`
+
+Auth: `Authorization: Bearer <API_KEY>` or `X-API-Key: <API_KEY>`.
+
+```jsonc
+// one company                                  -> the result object directly
+{ "domain": "stripe.com", "name": "Stripe" }
+
+// several (also accepted: a bare top-level array, and plain domain strings)
+{ "companies": [ { "domain": "stripe.com", "name": "Stripe" }, "acme.com" ] }
+
+// ignore stored results for this call
+{ "domain": "stripe.com", "force_refresh": true }
+```
+
+`domain` may be a bare host or a URL (`https://www.Acme.com/about` is treated
+as `acme.com`; `website` / `url` are accepted as aliases). `name` is optional
+but worth sending: it enables the name-screen shortcut, which can settle a
+clearly-operating business without scraping at all. Max 25 companies per
+request (`API_MAX_BATCH`).
+
+**The rule.** A stored result is returned as-is when the row is `checked` *and*
+was checked within the last `RESULT_MAX_AGE_MONTHS` (6) calendar months. "Checked
+at" is `metadata.checked_at`, or the row's `updated_at` for older rows that never
+had one. Anything else - no row, never checked, or older than that - goes through
+the normal pipeline (name screen -> scrape -> classify), is written to the row
+exactly as the batch job would write it, and is then read back and returned.
+
+**Response, one company** (HTTP status reflects the outcome):
+
+```json
+{
+  "domain": "acme.com",
+  "name": "Acme Inc",
+  "status": "ok",
+  "source": "cache",
+  "category": "Target",
+  "sub_category": "SaaS",
+  "note": "Target (SaaS): ...",
+  "classification_source": "scrape",
+  "checked_at": "2026-08-02T10:14:09.312Z"
+}
+```
+
+`source` is `"cache"` (served from the database) or `"fresh"` (researched just
+now). Fresh results also carry `refresh_reason`: `not_found`, `not_checked`,
+`stale`, or `forced`.
+
+**Response, several:** always HTTP 200, with per-company outcomes in input order:
+
+```json
+{ "summary": { "total": 3, "from_cache": 2, "researched": 1, "failed": 0, "in_progress": 0 },
+  "results": [ { "domain": "...", "status": "ok", ... } ] }
+```
+
+Failures are per company (`status: "error"`, with `error_code` and `error`):
+
+| `error_code` | Single-company HTTP | Meaning |
+|---|---|---|
+| `invalid_domain` | 400 | not a usable public hostname (`localhost`, IPs, garbage) |
+| `processing_failed` | 502 | the scrape or model failed; the reason is stored in the row's `errors` too |
+| `internal_error` | 500 | database problem; details are in the server log only |
+| `in_progress` (`status: "in_progress"`) | 202 + `Retry-After` | someone else is still researching it - retry shortly |
+
+When re-researching an older row fails, the error carries `last_known` (the
+previous classification), so a flaky scrape doesn't leave you with nothing.
+
+Other errors: `401` bad/missing key, `400` bad JSON or body, `413` too many
+companies or body over 1 MB, `405`/`404`. `GET /health` (no auth) is a
+liveness probe.
+
+### Behaviour worth knowing
+
+- **Synchronous.** A miss waits for the scrape and model calls, typically tens of
+  seconds per company; a batch of misses runs `API_CONCURRENCY` at a time. Set
+  your client and gateway timeouts accordingly (Cloud Run: `--timeout`). If the
+  client disconnects, the research still finishes and is stored.
+- **No double-paying.** Two requests for the same domain at once share one run.
+  The API stamps `processing_started_at` on the row (the same claim the batch job
+  uses), so the cron job skips a row the API is working on, the API waits for a
+  row the cron job is working on (up to `API_WAIT_FOR_INFLIGHT_MS`), and separate
+  API instances don't collide. A claim from a crashed process expires after
+  `STALE_CLAIM_MS`.
+- **Same rows as the batch job.** New domains are inserted with `id` = the bare
+  domain and `added_via: "api"`. Token usage accumulates per row as usual.
+- **Domain matching.** Existing rows are matched on `metadata.domain` or `id`,
+  case-insensitively, tolerating a `www.` prefix, a scheme, and a trailing slash.
+  Only a leading `www.` is stripped; `blog.acme.com` and `acme.com` are different
+  companies here.
+- **Failed refresh flips `checked` to false** (the pipeline's existing behaviour),
+  so the next request retries it. Repeatedly calling with a domain that always
+  fails will re-scrape every time.
+- **SSH tunnel self-heals.** If Postgres is reached over an SSH tunnel and it drops
+  (network blip, sshd restart, idle timeout), the API rebuilds the tunnel and
+  connection pool on the next query - one rebuild however many requests arrive at
+  once - instead of failing until the instance restarts. Requests that were mid-query
+  when it dropped fail with `internal_error`; their rows are recoverable (see claims above).
+- **Sheets mirroring** (`SHEET_WRITEBACK_ENABLED`) applies to API-researched rows
+  too, if you have it on.
+
 ## What changed in this version
 
 ### 1. The work queue is the database, not the sheet
@@ -139,20 +254,27 @@ accepts any host key by default, so without a pin the tunnel doesn't verify
 it's really your server (the app logs a warning when this is the case).
 See SETUP.md "SSH by password" for how to capture and pin it if you want that.
 
-### 6. Tavily as an alternative scraper
+### 6. Tavily as the (only) crawler, with sitemap + multi-page text
 
-`src/tavily.ts` wraps Tavily Extract behind the same interface as Firecrawl,
-selected by `SCRAPE_PROVIDER` / `SCRAPE_FALLBACK_PROVIDER` and gated by
-`TAVILY_ENABLED`. Both return the same `{ markdown, provider }` shape, so
-nothing downstream knows which one answered; the row records which did.
-
-Toggle it from `docker-compose.yml` without editing `.env` or any code:
+Tavily can be the sole provider - no Firecrawl key needed:
 
 ```bash
-docker compose up --build                                            # Firecrawl only
-TAVILY_ENABLED=true TAVILY_API_KEY=tvly-... docker compose up --build  # + Tavily rescues failures
-TAVILY_ENABLED=true SCRAPE_PROVIDER=tavily TAVILY_API_KEY=tvly-... docker compose up --build  # Tavily first
+TAVILY_ENABLED=true SCRAPE_PROVIDER=tavily SCRAPE_FALLBACK_PROVIDER=none \
+TAVILY_API_KEY=tvly-... docker compose up --build
 ```
+
+With `SITE_CRAWL_ENABLED=true` (default) each company goes through `src/siteCrawl.ts`:
+
+1. **Map** - Tavily `/map` follows links from the homepage and returns the site's URLs -> saved to the **`sitemap`** column (TEXT, one URL per line).
+2. **Select** - the homepage plus the pages most likely to describe the business (about, services, products, portfolio, investment criteria, ...); blog/news/careers/legal/PDF URLs are skipped.
+3. **Extract** - those pages, as markdown, in one Tavily `/extract` call.
+4. **Build** - each page is cleaned, capped (`SITE_MAX_CHARS_PER_PAGE`), labelled `=== PAGE: <url> ===`, and the total is capped (`SITE_MAX_TOTAL_CHARS`). This text is what the model receives and what is saved to the **`scraped_text`** column.
+
+Both columns are written right after the crawl and *before* the model call, so a failed categorization never loses a paid crawl. Rows settled by the name screen are never crawled, so both columns stay `NULL` for them. `SITE_CRAWL_ENABLED=false` restores the old homepage-only behaviour (`sitemap` stays `NULL`). With Firecrawl as provider, `scraped_text` is filled from its single page and `sitemap` stays `NULL`.
+
+Tavily Map discovers pages by following links; it does not read `/sitemap.xml`, so a page that nothing links to will not appear in `sitemap`.
+
+**Existing database:** run `migration.sql` first (adds the two columns). The app checks for them at startup and refuses to run without them.
 
 ### 7. Name + domain pre-screen
 
@@ -195,7 +317,10 @@ Trade-offs to know about:
 
 | File | Role |
 |---|---|
-| `src/index.ts` | entrypoint, cron, graceful shutdown |
+| `src/index.ts` | batch entrypoint, cron, graceful shutdown |
+| `src/server.ts` | HTTP API entrypoint: auth, request parsing, routing |
+| `src/research.ts` | API logic: cache check -> claim -> `processCompany()` -> read back |
+| `src/domain.ts` | domain normalisation + the spellings to look up |
 | `src/pipeline.ts` | claim → name screen → scrape → classify → write back, worker pool |
 | `src/llm.ts` | provider switch (`LLM_PROVIDER`) — the only file pipeline.ts/index.ts import from for LLM calls |
 | `src/claudeAgent.ts` | Anthropic backend: client, prompt caching, cache pre-warm, usage extraction |
@@ -204,9 +329,10 @@ Trade-offs to know about:
 | `src/categorization.ts` | categorizer JSON parsing/validation + category flattening, shared by both backends |
 | `src/nameScreen.ts` | Anthropic-backed name + domain pre-screen call |
 | `src/nameScreenParsing.ts` | name-screen input cleaning + output parsing, shared by both backends |
-| `src/db.ts` | claim query, JSONB merge writes, token accumulation |
+| `src/db.ts` | claim query, JSONB merge writes, token accumulation, API lookup + claim |
 | `src/scraper.ts` | provider selection and fallback |
-| `src/firecrawl.ts`, `src/tavily.ts` | the two scrapers |
+| `src/firecrawl.ts`, `src/tavily.ts` | the two scrapers (Tavily: extract + map) |
+| `src/siteCrawl.ts` | Tavily multi-page flow: map -> select pages -> extract -> build `scraped_text` |
 | `src/rateLimit.ts` | token bucket + concurrency + AIMD backoff |
 | `src/retry.ts` | retry with Retry-After and jittered backoff |
 | `src/config.ts` | env parsing and startup validation |
@@ -219,6 +345,7 @@ npm install
 npm run dev:once     # one batch from TypeScript source
 npm run build && npm start   # compiled, self-scheduling
 npm run typecheck
+npm run dev:server   # the HTTP API, from source (needs API_KEY)
 docker compose up --build    # the real image, against a local Postgres
 ```
 
